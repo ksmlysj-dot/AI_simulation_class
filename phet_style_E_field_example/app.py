@@ -1,179 +1,102 @@
 from __future__ import annotations
 
-import re
-
 import numpy as np
 import plotly.graph_objects as go
 from dash import Dash, Input, Output, State, ctx, dcc, html
 
-from physics import field_and_potential, probe_measurement
+from physics import acceleration, potential, potential_energy, step_state, time_to_land
 
 
 # ------------------------------------------------------------
 # Classroom defaults
 # ------------------------------------------------------------
-DEFAULT_POSITIONS = {
-    "x1": -1.5,
-    "y1": 1.0,
-    "x2": 1.5,
-    "y2": 0.0,
+D_DEFAULT = 4.0
+E_DEFAULT = 1.0
+Q_DEFAULT = 1.0
+M_DEFAULT = 1.0
+Y0_DEFAULT = D_DEFAULT - 0.3
+
+PLATE_HALF_WIDTH = 3.5
+CHARGE_RADIUS = 0.18
+INTERVAL_MS = 50
+
+# Fixed velocity-graph frame: the axis range and tick spacing never change
+# with q/E/m/y0, so a steeper or shallower line is the only visible sign
+# that the acceleration changed - the grid itself never moves.
+V_GRAPH_T_MAX = 8.0
+V_GRAPH_T_DTICK = 1.0
+V_GRAPH_V_MAX = 10.0
+V_GRAPH_V_DTICK = 1.0
+
+DEFAULT_SIM_STATE = {
+    "y": Y0_DEFAULT,
+    "v": 0.0,
+    "t": 0.0,
+    "running": False,
+    "history": [[0.0, 0.0]],
 }
-CHARGE_RADIUS = 0.50
-AXIS_LIMIT = 5.0
-POSITION_LIMIT = AXIS_LIMIT - CHARGE_RADIUS - 0.05
 
 
-def clamp(value: float, low: float, high: float) -> float:
-    return max(low, min(high, float(value)))
-
-
-def charge_style(q: float) -> tuple[str, str]:
-    """Return fill and border colors according to charge sign."""
-    if q > 0:
-        return "rgba(220, 60, 60, 0.82)", "rgba(145, 25, 25, 1)"
-    if q < 0:
-        return "rgba(55, 105, 210, 0.82)", "rgba(30, 65, 145, 1)"
-    return "rgba(130, 130, 130, 0.75)", "rgba(80, 80, 80, 1)"
-
-
-def _box_from_center(x: float, y: float) -> dict[str, float]:
-    return {
-        "x0": x - CHARGE_RADIUS,
-        "x1": x + CHARGE_RADIUS,
-        "y0": y - CHARGE_RADIUS,
-        "y1": y + CHARGE_RADIUS,
-    }
-
-
-def _center_from_box(box: dict[str, float]) -> tuple[float, float]:
-    x = 0.5 * (box["x0"] + box["x1"])
-    y = 0.5 * (box["y0"] + box["y1"])
-    return (
-        clamp(x, -POSITION_LIMIT, POSITION_LIMIT),
-        clamp(y, -POSITION_LIMIT, POSITION_LIMIT),
-    )
-
-
-def update_positions_from_relayout(
-    relayout_data: dict | None,
-    positions: dict[str, float],
-) -> dict[str, float]:
-    """Read dragged Plotly circle positions from relayoutData.
-
-    Plotly can also resize an editable shape.  For this classroom app we only
-    keep its new CENTER and redraw it at the original radius, so the charge
-    always remains a fixed-size circle.
-    """
-    if not relayout_data:
-        return dict(positions)
-
-    boxes = [
-        _box_from_center(positions["x1"], positions["y1"]),
-        _box_from_center(positions["x2"], positions["y2"]),
-    ]
-
-    # Plotly sometimes sends the complete shape list.
-    if "shapes" in relayout_data:
-        shapes = relayout_data["shapes"]
-        for i in range(min(2, len(shapes))):
-            for key in ("x0", "x1", "y0", "y1"):
-                if key in shapes[i]:
-                    boxes[i][key] = float(shapes[i][key])
-
-    # When an existing shape is edited, Plotly often sends only changed keys:
-    # "shapes[0].x0", "shapes[0].x1", ...
-    pattern = re.compile(r"shapes\[(\d+)\]\.(x0|x1|y0|y1)")
-    for key, value in relayout_data.items():
-        match = pattern.fullmatch(key)
-        if match:
-            shape_index = int(match.group(1))
-            coordinate = match.group(2)
-            if shape_index < 2:
-                boxes[shape_index][coordinate] = float(value)
-
-    x1, y1 = _center_from_box(boxes[0])
-    x2, y2 = _center_from_box(boxes[1])
-
-    return {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
+def fresh_sim_state(y0: float) -> dict:
+    return {"y": y0, "v": 0.0, "t": 0.0, "running": False, "history": [[0.0, 0.0]]}
 
 
 def build_figure(
-    q1: float,
-    q2: float,
-    positions: dict[str, float],
-    probe_x: float,
-    probe_y: float,
+    d: float,
+    E: float,
+    q: float,
+    y_current: float,
     show_vectors: bool,
     show_potential: bool,
 ) -> go.Figure:
-    charges = [
-        (q1, positions["x1"], positions["y1"]),
-        (q2, positions["x2"], positions["y2"]),
-    ]
-
-    axis = np.linspace(-AXIS_LIMIT, AXIS_LIMIT, 121)
-    X, Y = np.meshgrid(axis, axis)
-    _, _, V = field_and_potential(X, Y, charges)
-
     fig = go.Figure()
 
-    # Equipotential contours
+    # Equipotential lines (V depends only on y, so these are horizontal)
     if show_potential:
-        clip = max(1.0, float(np.percentile(np.abs(V), 92)))
-        fig.add_trace(
-            go.Contour(
-                x=axis,
-                y=axis,
-                z=np.clip(V, -clip, clip),
-                contours=dict(coloring="lines", showlabels=False),
-                line=dict(width=1),
-                colorbar=dict(title="V"),
-                hovertemplate="x=%{x:.2f}<br>y=%{y:.2f}<br>V=%{z:.3f}<extra></extra>",
-                name="Equipotential",
+        for frac in (0.25, 0.5, 0.75):
+            y_line = frac * d
+            v_line = potential(y_line, E, d)
+            fig.add_shape(
+                type="line",
+                x0=-PLATE_HALF_WIDTH,
+                x1=PLATE_HALF_WIDTH,
+                y0=y_line,
+                y1=y_line,
+                line=dict(color="rgba(120,120,120,0.6)", width=1, dash="dot"),
             )
-        )
+            fig.add_annotation(
+                x=PLATE_HALF_WIDTH + 0.15,
+                y=y_line,
+                text=f"V={v_line:.2f}",
+                showarrow=False,
+                xanchor="left",
+                font=dict(size=10, color="gray"),
+            )
 
-    # Electric-field vectors
+    # Uniform, downward electric-field arrows between the plates
     if show_vectors:
-        coarse = np.linspace(-4.6, 4.6, 19)
-        XV, YV = np.meshgrid(coarse, coarse)
-        EVx, EVy, _ = field_and_potential(XV, YV, charges)
+        cols = np.linspace(-PLATE_HALF_WIDTH + 0.6, PLATE_HALF_WIDTH - 0.6, 7)
+        rows = np.linspace(d * 0.15, d * 0.85, 4)
+        arrow_len = min(0.35, d * 0.15)
 
-        mag = np.hypot(EVx, EVy)
-        ux = EVx / (mag + 1e-12)
-        uy = EVy / (mag + 1e-12)
-
-        arrow_length = 0.32
         xs: list[float | None] = []
         ys: list[float | None] = []
         hx: list[float] = []
         hy: list[float] = []
-        angles: list[float] = []
-
-        for x0, y0, dx, dy in zip(
-            XV.ravel(), YV.ravel(), ux.ravel(), uy.ravel()
-        ):
-            near_charge = any(
-                (x0 - cx) ** 2 + (y0 - cy) ** 2 < 0.42**2
-                for _, cx, cy in charges
-            )
-            if near_charge:
-                continue
-
-            x_end = x0 + arrow_length * dx
-            y_end = y0 + arrow_length * dy
-            xs.extend([x0, x_end, None])
-            ys.extend([y0, y_end, None])
-            hx.append(x_end)
-            hy.append(y_end)
-            angles.append(float(np.degrees(np.arctan2(dy, dx)) - 90.0))
+        for x0 in cols:
+            for y0_row in rows:
+                y_end = y0_row - arrow_len
+                xs.extend([x0, x0, None])
+                ys.extend([y0_row, y_end, None])
+                hx.append(x0)
+                hy.append(y_end)
 
         fig.add_trace(
             go.Scatter(
                 x=xs,
                 y=ys,
                 mode="lines",
-                line=dict(width=1),
+                line=dict(width=1, color="rgba(30,90,190,0.8)"),
                 hoverinfo="skip",
                 name="E field",
             )
@@ -183,77 +106,240 @@ def build_figure(
                 x=hx,
                 y=hy,
                 mode="markers",
-                marker=dict(symbol="triangle-up", size=5, angle=angles),
+                marker=dict(symbol="triangle-down", size=7, color="rgba(30,90,190,0.8)"),
                 hoverinfo="skip",
                 showlegend=False,
             )
         )
 
-    # Probe
+    # Top (+) and bottom (-) plates
+    fig.add_shape(
+        type="rect",
+        x0=-PLATE_HALF_WIDTH,
+        x1=PLATE_HALF_WIDTH,
+        y0=d,
+        y1=d + 0.18,
+        fillcolor="rgba(190,60,60,0.85)",
+        line=dict(width=0),
+    )
+    fig.add_shape(
+        type="rect",
+        x0=-PLATE_HALF_WIDTH,
+        x1=PLATE_HALF_WIDTH,
+        y0=-0.18,
+        y1=0,
+        fillcolor="rgba(60,90,190,0.85)",
+        line=dict(width=0),
+    )
+    for xp in np.linspace(-PLATE_HALF_WIDTH + 0.3, PLATE_HALF_WIDTH - 0.3, 9):
+        fig.add_annotation(x=xp, y=d + 0.09, text="+", showarrow=False, font=dict(size=16, color="white"))
+        fig.add_annotation(x=xp, y=-0.09, text="−", showarrow=False, font=dict(size=16, color="white"))
+
+    # Reference line/label at the bottom plate (PE = 0)
+    fig.add_annotation(
+        x=-PLATE_HALF_WIDTH + 0.15,
+        y=0,
+        text="기준 (위치 에너지: 0)",
+        showarrow=False,
+        xanchor="left",
+        yanchor="bottom",
+        font=dict(size=11),
+    )
+
+    # Dashed vertical drop line + horizontal PE line from the charge
+    pe_current = potential_energy(y_current, q, E, d)
+    fig.add_shape(
+        type="line",
+        x0=0,
+        x1=0,
+        y0=0,
+        y1=y_current,
+        line=dict(color="rgba(0,0,0,0.5)", width=1, dash="dash"),
+    )
+    fig.add_shape(
+        type="line",
+        x0=-PLATE_HALF_WIDTH + 1.6,
+        x1=0,
+        y0=y_current,
+        y1=y_current,
+        line=dict(color="rgba(0,0,0,0.4)", width=1, dash="dash"),
+    )
+    fig.add_annotation(
+        x=-PLATE_HALF_WIDTH + 0.15,
+        y=y_current,
+        text=f"위치 에너지: qEy ≈ {pe_current:.2f}",
+        showarrow=False,
+        xanchor="left",
+        yanchor="bottom",
+        font=dict(size=11),
+    )
+
+    # Force vector qE, pointing down from the charge
+    force = q * E
+    arrow_len = min(0.9, 0.25 * force + 0.2)
+    fig.add_annotation(
+        x=0.55,
+        y=max(y_current - arrow_len, 0.0),
+        ax=0.55,
+        ay=y_current,
+        xref="x",
+        yref="y",
+        axref="x",
+        ayref="y",
+        showarrow=True,
+        arrowhead=3,
+        arrowwidth=2,
+        arrowcolor="rgba(220,90,40,0.9)",
+    )
+    fig.add_annotation(
+        x=0.85,
+        y=max(y_current - arrow_len / 2, 0.0),
+        text="qE",
+        showarrow=False,
+        font=dict(size=12, color="rgba(220,90,40,0.9)"),
+    )
+
+    # The moving unit charge
+    fig.add_shape(
+        type="circle",
+        x0=-CHARGE_RADIUS,
+        x1=CHARGE_RADIUS,
+        y0=y_current - CHARGE_RADIUS,
+        y1=y_current + CHARGE_RADIUS,
+        fillcolor="rgba(150,60,170,0.9)",
+        line=dict(color="rgba(90,20,110,1)", width=2),
+    )
+    fig.add_annotation(
+        x=0,
+        y=y_current + 0.35,
+        text=f"+q ({q:.1f})",
+        showarrow=False,
+        font=dict(size=12),
+    )
+
+    fig.update_layout(
+        height=650,
+        margin=dict(l=25, r=90, t=20, b=20),
+        xaxis=dict(
+            range=[-PLATE_HALF_WIDTH - 0.5, PLATE_HALF_WIDTH + 0.5],
+            visible=False,
+            fixedrange=True,
+            scaleanchor="y",
+            scaleratio=1,
+        ),
+        yaxis=dict(
+            range=[-0.6, d + 0.9],
+            title="높이 y",
+            fixedrange=True,
+            zeroline=False,
+        ),
+        showlegend=False,
+        uirevision="capacitor-classroom",
+    )
+    return fig
+
+
+def build_velocity_figure(
+    history: list[list[float]],
+    y_current: float,
+    v_current: float,
+    t_current: float,
+    a: float,
+) -> go.Figure:
+    """Plot the actual v(t) travelled so far plus a live forward projection.
+
+    `history` holds every (t, v) sample recorded tick by tick, so if q, E or
+    m changed mid-fall the recorded slope visibly kinks at that instant
+    instead of being a single straight line. The dotted projection always
+    extrapolates from the charge's *current* state using the *current*
+    acceleration, so its slope updates the moment a slider changes.
+
+    The axis range and tick spacing (V_GRAPH_*) are fixed constants, never
+    recomputed from the trajectory - so when q, E or m change, the grid
+    itself stays put and only the line's slope visibly changes.
+    """
+    fig = go.Figure()
+
+    t_hist = [point[0] for point in history]
+    v_hist = [point[1] for point in history]
+
+    t_land = time_to_land(y_current, v_current, a) if y_current > 1e-9 else 0.0
+    if t_land > 0:
+        t_pred_full = np.linspace(t_current, t_current + t_land, 30)
+        v_pred_full = v_current + a * (t_pred_full - t_current)
+        in_frame = (t_pred_full <= V_GRAPH_T_MAX) & (v_pred_full <= V_GRAPH_V_MAX)
+        visible_count = int(np.argmin(in_frame)) if not in_frame.all() else len(in_frame)
+        t_pred = t_pred_full[:visible_count]
+        v_pred = v_pred_full[:visible_count]
+    else:
+        t_pred = np.array([])
+        v_pred = np.array([])
+
+    if len(t_pred) > 1:
+        fig.add_trace(
+            go.Scatter(
+                x=t_pred,
+                y=v_pred,
+                mode="lines",
+                line=dict(color="rgba(120,120,120,0.5)", width=1.5, dash="dot"),
+                hoverinfo="skip",
+                name="지금 기울기 유지 시 예상",
+            )
+        )
+        if len(t_pred) == 30:  # the full projection to landing fit on screen
+            fig.add_annotation(
+                x=t_pred[-1],
+                y=v_pred[-1],
+                text=f"착지 예상 v ≈ {v_pred[-1]:.2f}",
+                showarrow=True,
+                arrowhead=2,
+                ax=-35,
+                ay=-20,
+                font=dict(size=10),
+            )
+
     fig.add_trace(
         go.Scatter(
-            x=[probe_x],
-            y=[probe_y],
+            x=t_hist,
+            y=v_hist,
+            mode="lines",
+            line=dict(color="rgba(150,60,170,0.9)", width=3),
+            hoverinfo="skip",
+            name="v(t)",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=[t_current],
+            y=[v_current],
             mode="markers",
-            marker=dict(symbol="x", size=14, line=dict(width=2)),
-            name="Probe",
-            hovertemplate="Probe<br>x=%{x:.2f}<br>y=%{y:.2f}<extra></extra>",
+            marker=dict(color="rgba(150,60,170,1)", size=10),
+            hoverinfo="skip",
+            showlegend=False,
         )
     )
 
-    # Draggable charge circles are Plotly layout shapes.
-    for index, (q, x, y) in enumerate(charges, start=1):
-        fill, border = charge_style(q)
-        sign = "+" if q > 0 else "−" if q < 0 else "0"
-
-        fig.add_shape(
-            type="circle",
-            xref="x",
-            yref="y",
-            x0=x - CHARGE_RADIUS,
-            x1=x + CHARGE_RADIUS,
-            y0=y - CHARGE_RADIUS,
-            y1=y + CHARGE_RADIUS,
-            fillcolor=fill,
-            line=dict(color=border, width=2),
-            editable=True,
-            name=f"q{index}",
-        )
-        fig.add_annotation(
-            x=x,
-            y=y,
-            text=f"<b>{sign}</b>",
-            showarrow=False,
-            font=dict(size=20),
-        )
-        fig.add_annotation(
-            x=x,
-            y=y + 0.55,
-            text=f"q{index}={q:+.1f}",
-            showarrow=False,
-            font=dict(size=12),
-        )
-
     fig.update_layout(
-        height=690,
-        margin=dict(l=25, r=25, t=20, b=20),
+        height=650,
+        margin=dict(l=50, r=15, t=20, b=40),
         xaxis=dict(
-            title="x",
-            range=[-AXIS_LIMIT, AXIS_LIMIT],
-            scaleanchor="y",
-            scaleratio=1,
+            title="시간 t (s)",
+            range=[0, V_GRAPH_T_MAX],
+            dtick=V_GRAPH_T_DTICK,
+            autorange=False,
             fixedrange=True,
             zeroline=True,
         ),
         yaxis=dict(
-            title="y",
-            range=[-AXIS_LIMIT, AXIS_LIMIT],
+            title="속도 v",
+            range=[0, V_GRAPH_V_MAX],
+            dtick=V_GRAPH_V_DTICK,
+            autorange=False,
             fixedrange=True,
             zeroline=True,
         ),
-        legend=dict(orientation="h", y=1.03),
-        hovermode="closest",
-        uirevision="electric-field-classroom",
+        showlegend=False,
+        uirevision="velocity-graph",
     )
     return fig
 
@@ -273,12 +359,13 @@ CARD_STYLE = {
 
 app.layout = html.Div(
     [
-        dcc.Store(id="positions", data=DEFAULT_POSITIONS),
+        dcc.Store(id="sim-state", data=dict(DEFAULT_SIM_STATE)),
+        dcc.Interval(id="ticker", interval=INTERVAL_MS, n_intervals=0, disabled=True),
 
         html.H1("⚡ Electric Field Playground", style={"marginBottom": "4px"}),
         html.P(
-            "전하 원을 클릭한 뒤 드래그해서 위치를 바꿔 보세요. "
-            "전기장과 등전위선은 Python에서 다시 계산됩니다.",
+            "평행판 축전기 사이의 균일한 전기장 안에 양전하를 놓고, "
+            "그 전하가 아래로 떨어지는 모습을 관찰해 보세요.",
             style={"marginTop": "0"},
         ),
 
@@ -289,25 +376,60 @@ app.layout = html.Div(
                     [
                         html.Div(
                             [
-                                html.H3("전하량"),
-                                html.Label("q₁"),
+                                html.H3("판 & 전기장"),
+                                html.Label("판 간격 d"),
                                 dcc.Slider(
-                                    id="q1",
-                                    min=-5,
-                                    max=5,
+                                    id="d-slider",
+                                    min=2.0,
+                                    max=6.0,
                                     step=0.5,
-                                    value=2.0,
-                                    marks={-5: "-5", 0: "0", 5: "+5"},
+                                    value=D_DEFAULT,
+                                    marks={2: "2", 4: "4", 6: "6"},
                                 ),
                                 html.Br(),
-                                html.Label("q₂"),
+                                html.Label("전기장 세기 E"),
                                 dcc.Slider(
-                                    id="q2",
-                                    min=-5,
-                                    max=5,
-                                    step=0.5,
-                                    value=-2.0,
-                                    marks={-5: "-5", 0: "0", 5: "+5"},
+                                    id="e-slider",
+                                    min=0.2,
+                                    max=2.0,
+                                    step=0.1,
+                                    value=E_DEFAULT,
+                                    marks={0.2: "0.2", 1: "1", 2: "2"},
+                                ),
+                            ],
+                            style=CARD_STYLE,
+                        ),
+
+                        html.Div(
+                            [
+                                html.H3("전하 설정"),
+                                html.Label("전하량 q (+)"),
+                                dcc.Slider(
+                                    id="q-slider",
+                                    min=0.2,
+                                    max=3.0,
+                                    step=0.1,
+                                    value=Q_DEFAULT,
+                                    marks={0.2: "0.2", 1: "1", 3: "3"},
+                                ),
+                                html.Br(),
+                                html.Label("질량 m"),
+                                dcc.Slider(
+                                    id="m-slider",
+                                    min=0.2,
+                                    max=3.0,
+                                    step=0.1,
+                                    value=M_DEFAULT,
+                                    marks={0.2: "0.2", 1: "1", 3: "3"},
+                                ),
+                                html.Br(),
+                                html.Label("초기 높이 y₀"),
+                                dcc.Slider(
+                                    id="y0-slider",
+                                    min=0.0,
+                                    max=D_DEFAULT,
+                                    step=0.1,
+                                    value=Y0_DEFAULT,
                                 ),
                             ],
                             style=CARD_STYLE,
@@ -331,37 +453,22 @@ app.layout = html.Div(
 
                         html.Div(
                             [
-                                html.H3("측정 Probe"),
-                                html.Label("Probe x"),
-                                dcc.Slider(
-                                    id="probe-x",
-                                    min=-4.8,
-                                    max=4.8,
-                                    step=0.1,
-                                    value=0.0,
-                                    marks={-4: "-4", 0: "0", 4: "4"},
+                                html.Button(
+                                    "놓기 (낙하 시작)",
+                                    id="release",
+                                    n_clicks=0,
+                                    style={"padding": "9px 14px", "cursor": "pointer", "marginRight": "8px"},
                                 ),
-                                html.Br(),
-                                html.Label("Probe y"),
-                                dcc.Slider(
-                                    id="probe-y",
-                                    min=-4.8,
-                                    max=4.8,
-                                    step=0.1,
-                                    value=2.0,
-                                    marks={-4: "-4", 0: "0", 4: "4"},
+                                html.Button(
+                                    "리셋",
+                                    id="reset",
+                                    n_clicks=0,
+                                    style={"padding": "9px 14px", "cursor": "pointer"},
                                 ),
-                                html.Div(id="probe-readout", style={"marginTop": "14px"}),
-                            ],
-                            style=CARD_STYLE,
+                            ]
                         ),
 
-                        html.Button(
-                            "위치 초기화",
-                            id="reset",
-                            n_clicks=0,
-                            style={"padding": "9px 14px", "cursor": "pointer"},
-                        ),
+                        html.Div(id="sim-readout", style={"marginTop": "14px", "fontFamily": "monospace"}),
                     ],
                     style={"minWidth": "260px", "flex": "0 0 300px"},
                 ),
@@ -374,7 +481,6 @@ app.layout = html.Div(
                             config={
                                 "displaylogo": False,
                                 "editable": False,
-                                "edits": {"shapePosition": True},
                                 "modeBarButtonsToRemove": [
                                     "zoom2d",
                                     "pan2d",
@@ -385,16 +491,30 @@ app.layout = html.Div(
                             },
                             style={"width": "100%"},
                         ),
-                        html.Div(
-                            id="position-readout",
-                            style={
-                                "fontFamily": "monospace",
-                                "fontSize": "14px",
-                                "margin": "4px 0 12px 8px",
-                            },
-                        ),
                     ],
                     style={"flex": "1 1 700px", "minWidth": "0"},
+                ),
+
+                # Velocity-time graph
+                html.Div(
+                    [
+                        html.H3("시간-속도 그래프", style={"marginTop": "0"}),
+                        dcc.Graph(
+                            id="velocity-graph",
+                            config={
+                                "displaylogo": False,
+                                "modeBarButtonsToRemove": [
+                                    "zoom2d",
+                                    "pan2d",
+                                    "select2d",
+                                    "lasso2d",
+                                    "autoScale2d",
+                                ],
+                            },
+                            style={"width": "100%"},
+                        ),
+                    ],
+                    style={"flex": "0 0 340px", "minWidth": "280px"},
                 ),
             ],
             style={
@@ -408,15 +528,15 @@ app.layout = html.Div(
         html.H3("생각해 보기"),
         html.Ol(
             [
-                html.Li("두 전하를 가까이/멀리 드래그하면 중앙의 |E|는 어떻게 변할까?"),
-                html.Li("q₁과 q₂의 부호를 같게 만들면 등전위선은 어떻게 달라질까?"),
-                html.Li("Probe를 전기장이 0에 가까운 위치로 옮겨 보자."),
-                html.Li("전하량을 2배로 바꾸면 같은 위치에서 |E|와 V는 어떻게 변할까?"),
+                html.Li("초기 높이 y₀를 높이면 바닥에 닿는 속도는 어떻게 달라질까?"),
+                html.Li("전하량 q를 2배로 늘리면 가속도 a=qE/m은 어떻게 변할까?"),
+                html.Li("질량 m을 키우면 낙하 속도는 어떻게 변할까?"),
+                html.Li("전하가 절반 높이에 있을 때 위치 에너지는 최대값의 몇 %일까?"),
             ]
         ),
     ],
     style={
-        "maxWidth": "1250px",
+        "maxWidth": "1650px",
         "margin": "0 auto",
         "padding": "18px",
         "fontFamily": "Arial, sans-serif",
@@ -425,73 +545,120 @@ app.layout = html.Div(
 
 
 @app.callback(
+    Output("y0-slider", "max"),
+    Output("y0-slider", "value"),
+    Input("d-slider", "value"),
+    State("y0-slider", "value"),
+)
+def clamp_initial_height(d_value, y0_value):
+    d_value = float(d_value)
+    y0_value = d_value if y0_value is None else min(float(y0_value), d_value)
+    return d_value, y0_value
+
+
+@app.callback(
     Output("field-graph", "figure"),
-    Output("positions", "data"),
-    Output("probe-readout", "children"),
-    Output("position-readout", "children"),
-    Input("field-graph", "relayoutData"),
-    Input("q1", "value"),
-    Input("q2", "value"),
-    Input("probe-x", "value"),
-    Input("probe-y", "value"),
-    Input("display-options", "value"),
+    Output("velocity-graph", "figure"),
+    Output("sim-state", "data"),
+    Output("ticker", "disabled"),
+    Output("sim-readout", "children"),
+    Input("ticker", "n_intervals"),
+    Input("release", "n_clicks"),
     Input("reset", "n_clicks"),
-    State("positions", "data"),
+    Input("d-slider", "value"),
+    Input("e-slider", "value"),
+    Input("q-slider", "value"),
+    Input("m-slider", "value"),
+    Input("y0-slider", "value"),
+    Input("display-options", "value"),
+    State("sim-state", "data"),
 )
 def update_app(
-    relayout_data,
-    q1,
-    q2,
-    probe_x,
-    probe_y,
-    display_options,
+    n_intervals,
+    _release_clicks,
     _reset_clicks,
-    positions,
+    d,
+    E,
+    q,
+    m,
+    y0,
+    display_options,
+    sim_state,
 ):
-    positions = dict(positions or DEFAULT_POSITIONS)
-
-    if ctx.triggered_id == "reset":
-        positions = dict(DEFAULT_POSITIONS)
-    elif ctx.triggered_id == "field-graph":
-        positions = update_positions_from_relayout(relayout_data, positions)
-
-    q1 = float(q1 if q1 is not None else 0.0)
-    q2 = float(q2 if q2 is not None else 0.0)
-    probe_x = float(probe_x if probe_x is not None else 0.0)
-    probe_y = float(probe_y if probe_y is not None else 0.0)
+    d = float(d)
+    E = float(E)
+    q = float(q)
+    m = float(m)
+    y0 = float(y0)
     display_options = display_options or []
+    sim_state = dict(sim_state or DEFAULT_SIM_STATE)
 
-    charges = [
-        (q1, positions["x1"], positions["y1"]),
-        (q2, positions["x2"], positions["y2"]),
-    ]
+    triggered = ctx.triggered_id
+    a = acceleration(q, E, m)
 
-    ex, ey, emag, potential, theta = probe_measurement(probe_x, probe_y, charges)
+    if triggered == "reset":
+        sim_state = fresh_sim_state(y0)
+        ticker_disabled = True
+    elif triggered == "release":
+        sim_state = fresh_sim_state(y0)
+        sim_state["running"] = True
+        ticker_disabled = False
+    elif triggered == "ticker" and sim_state.get("running"):
+        dt = INTERVAL_MS / 1000.0
+        y, v, dt_used, landed = step_state(sim_state["y"], sim_state["v"], a, dt)
+        t = sim_state.get("t", 0.0) + dt_used
+        history = sim_state.get("history", [[0.0, 0.0]])
+        history.append([t, v])
+        sim_state["y"] = y
+        sim_state["v"] = v
+        sim_state["t"] = t
+        sim_state["history"] = history
+        if landed:
+            sim_state["running"] = False
+        ticker_disabled = not sim_state["running"]
+    elif triggered in ("q-slider", "e-slider", "m-slider") and sim_state.get("running"):
+        # Mid-fall parameter change: keep flying from the current (y, v, t) -
+        # the freshly recomputed `a` above takes effect starting next tick,
+        # so the charge and the velocity graph's slope update in lockstep.
+        ticker_disabled = False
+    elif triggered in ("d-slider", "e-slider", "q-slider", "m-slider", "y0-slider"):
+        sim_state = fresh_sim_state(y0)
+        ticker_disabled = True
+    else:
+        ticker_disabled = not sim_state.get("running", False)
+
+    y_current = sim_state.get("y", y0)
+    v_current = sim_state.get("v", 0.0)
+    t_current = sim_state.get("t", 0.0)
+    history = sim_state.get("history", [[0.0, 0.0]])
 
     fig = build_figure(
-        q1=q1,
-        q2=q2,
-        positions=positions,
-        probe_x=probe_x,
-        probe_y=probe_y,
+        d=d,
+        E=E,
+        q=q,
+        y_current=y_current,
         show_vectors="vectors" in display_options,
         show_potential="potential" in display_options,
     )
-
-    probe_children = [
-        html.Div(f"Eₓ = {ex:+.4f}"),
-        html.Div(f"Eᵧ = {ey:+.4f}"),
-        html.Div(f"|E| = {emag:.4f}"),
-        html.Div(f"V = {potential:+.4f}"),
-        html.Div(f"θ = {theta:+.2f}°"),
-    ]
-
-    position_text = (
-        f"q1 position = ({positions['x1']:+.2f}, {positions['y1']:+.2f})    "
-        f"q2 position = ({positions['x2']:+.2f}, {positions['y2']:+.2f})"
+    fig_v = build_velocity_figure(
+        history=history,
+        y_current=y_current,
+        v_current=v_current,
+        t_current=t_current,
+        a=a,
     )
 
-    return fig, positions, probe_children, position_text
+    pe_current = potential_energy(y_current, q, E, d)
+    pe_max = potential_energy(d, q, E, d)
+    readout = [
+        html.Div(f"a = qE/m = {a:.3f}"),
+        html.Div(f"t = {t_current:.3f} s"),
+        html.Div(f"y = {y_current:.3f}"),
+        html.Div(f"v = {v_current:.3f}"),
+        html.Div(f"PE = qEy = {pe_current:.3f} (최대 qEd = {pe_max:.3f})"),
+    ]
+
+    return fig, fig_v, sim_state, ticker_disabled, readout
 
 
 if __name__ == "__main__":
