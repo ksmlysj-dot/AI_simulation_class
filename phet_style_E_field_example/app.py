@@ -466,7 +466,7 @@ def update_app(
         (q2, positions["x2"], positions["y2"]),
     ]
 
-    ex, ey, emag, potential = probe_measurement(probe_x, probe_y, charges)
+    ex, ey, emag, potential, theta = probe_measurement(probe_x, probe_y, charges)
 
     fig = build_figure(
         q1=q1,
@@ -483,6 +483,7 @@ def update_app(
         html.Div(f"Eᵧ = {ey:+.4f}"),
         html.Div(f"|E| = {emag:.4f}"),
         html.Div(f"V = {potential:+.4f}"),
+        html.Div(f"θ = {theta:+.2f}°"),
     ]
 
     position_text = (

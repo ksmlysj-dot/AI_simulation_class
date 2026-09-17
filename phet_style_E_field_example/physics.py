@@ -48,7 +48,7 @@ def probe_measurement(
     x: float,
     y: float,
     charges: list[tuple[float, float, float]],
-) -> tuple[float, float, float, float]:
+) -> tuple[float, float, float, float, float]:
     """Return Ex, Ey, |E| and V at a single probe position."""
     xx = np.array([[x]], dtype=float)
     yy = np.array([[y]], dtype=float)
@@ -58,4 +58,5 @@ def probe_measurement(
     ey0 = float(ey[0, 0])
     v0 = float(v[0, 0])
     emag = float(np.hypot(ex0, ey0))
-    return ex0, ey0, emag, v0
+    theta = float(np.degrees(np.arctan2(ey0, ex0)))
+    return ex0, ey0, emag, v0, theta
